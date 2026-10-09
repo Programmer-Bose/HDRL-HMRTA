@@ -84,11 +84,14 @@ def sample_task_points(rng, n_tasks, max_tries=100000, *, return_meta=False):
     return (points_array, None) if return_meta else points_array
 
 
-def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False):
+def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False,
+                      robot_category=None):
     """Create a robot-task scenario.
 
     n_tasks=None -> the number of tasks is drawn from TASKS_PER_CATEGORY of each
     robot's category (for one robot: a single range). Pass an int to fix it.
+    robot_category=None -> sample categories randomly as before. Otherwise, force
+    all robots in the scenario to the requested category index (0..3).
 
     Returns the original five outputs by default. If return_meta=True,
     an additional error message is returned as the last element.
@@ -96,8 +99,9 @@ def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False):
     try:
         n_robots = int(n_robots)
         n_tasks = None if n_tasks is None else int(n_tasks)
+        robot_category = None if robot_category is None else int(robot_category)
     except (TypeError, ValueError):
-        error_msg = "n_robots and n_tasks must be integers."
+        error_msg = "n_robots, n_tasks, and robot_category must be integers."
         warnings.warn(error_msg, RuntimeWarning)
         empty_robots = {
             "category": np.array([], dtype=int),
@@ -122,8 +126,13 @@ def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False):
             )
         return empty_robots, empty_points, empty_payload, empty_service, probs
 
-    if n_robots <= 0 or (n_tasks is not None and n_tasks <= 0):
-        error_msg = "n_robots and n_tasks must be greater than 0."
+    n_categories = len(CATEGORIES["payload_kg"])
+    if (n_robots <= 0 or (n_tasks is not None and n_tasks <= 0)
+            or (robot_category is not None and not 0 <= robot_category < n_categories)):
+        error_msg = (
+            "n_robots and n_tasks must be greater than 0, and robot_category "
+            f"must be between 0 and {n_categories - 1}."
+        )
         warnings.warn(error_msg, RuntimeWarning)
         empty_robots = {
             "category": np.array([], dtype=int),
@@ -150,8 +159,12 @@ def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False):
 
     rng = np.random.default_rng(seed)
 
-    probs = rng.dirichlet(np.ones(4) * 5)
-    categories = rng.choice(4, size=n_robots, p=probs)
+    if robot_category is None:
+        probs = rng.dirichlet(np.ones(n_categories) * 5)
+        categories = rng.choice(n_categories, size=n_robots, p=probs)
+    else:
+        probs = np.eye(n_categories)[robot_category]
+        categories = np.full(n_robots, robot_category, dtype=int)
 
     robots = {
         "category": categories,

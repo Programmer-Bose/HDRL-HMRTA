@@ -34,16 +34,16 @@ from scenario_gen import generate_scenario
 RUN_ID = "ts3-run_002"
 SAVE_ROOT = "checkpoints"
 CKPT_PATH = ""                    # "" = latest checkpoint of RUN_ID, or give a .pt path
-TEST_START_SEED = 132          # unseen seeds (training used 43 ... 142)
-NUM_TEST_SCENARIOS = 10
+TEST_START_SEED = 1132          # unseen seeds (training used 43 ... 142)
+NUM_TEST_SCENARIOS = 1
 TEST_N_TASKS = None               # None = task count follows the robot category
 N_LAMBDAS = 11                    # lambda_E = 0, 0.1, ..., 1
 GREEDY = True                     # True = argmax actions, False = sample
 TEST_PREF_SWITCH_MAX_INJECTIONS = 2  # None = use checkpoint setting; set an int to override
 TEST_PREF_SWITCH_TASK_THRESHOLD = 10  # None = use checkpoint setting; set an int to override
 PLOT_LAMBDAS_E = [0.0, 0.2, 1.0]  # lambda_E values drawn in the 3D plots
-SAVE_FIGS = True
-SHOW_FIGS = False
+SAVE_FIGS = False
+SHOW_FIGS = True
 OUT_DIR = os.path.join("test_results", RUN_ID)
 PASS_THRESHOLD_PCT = 1.0          # energy-focused must save >= this % energy and lose >= this % time
 

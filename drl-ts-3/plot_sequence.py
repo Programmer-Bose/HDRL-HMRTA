@@ -23,12 +23,12 @@ from scenario_gen import generate_scenario
 # ======================================================================
 # SETTINGS  (edit here only)
 # ======================================================================
-RUN_ID = "ts3-run_002"             # used for the output folder only
+RUN_ID = "ts3-run_004"             # used for the output folder only
 MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "checkpoints",
-    "ts3-run_002",
-    "ts3-run_002_it00700_ep03500.pt",
+    "ts3-run_004",
+    "ts3-run_004_it05000_ep10000.pt",
 )                                  # set this to the exact checkpoint to visualize
 PREFERENCES = [                    # each row = [lambda_E, lambda_T]; rows are normalised to sum to 1
     [1.0, 0.0],                    # only energy
@@ -40,7 +40,7 @@ PREFERENCES = [                    # each row = [lambda_E, lambda_T]; rows are n
     
     
 ]
-SEED = 2000                       # scenario seed
+SEED = 10001                       # scenario seed
 N_TASKS = None                     # None = task count follows the robot category
 GREEDY = True                      # True = argmax actions, False = sample
 PREF_SWITCH_MAX_INJECTIONS = 2  # None = use checkpoint setting; set an int to override

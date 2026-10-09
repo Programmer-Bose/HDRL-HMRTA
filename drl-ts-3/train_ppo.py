@@ -55,27 +55,27 @@ from drone_energy import DroneEnergyModel, SPEED_LEVELS, RESERVE_SOC
 @dataclass
 class HP:
     # ---- run / checkpoints ---------------------------------------------
-    run_id: str = "ts3-run_003"            # checkpoints go to <save_root>/<run_id>/
+    run_id: str = "ts3-run_004"            # checkpoints go to <save_root>/<run_id>/
     save_root: str = "checkpoints"
-    save_every: int = 100               # save a checkpoint every N iterations (scenarios)
+    save_every: int = 500               # save a checkpoint every N iterations (scenarios)
     resume: bool = True               # True -> continue this run_id from its latest checkpoint
     resume_path: str = ""              # optional explicit .pt file ("" = latest in the run folder)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_seed: int = 42
+    torch_seed: int = 6
 
     # ---- scenarios -------------------------------------------------------
-    start_seed: int = 42               # scenarios use seeds start_seed ... start_seed + num_scenarios - 1
-    num_scenarios: int = 200
-    num_passes: int = 3                # how many times to sweep over the seed list
+    start_seed: int = 1               # scenarios use seeds start_seed ... start_seed + num_scenarios - 1
+    num_scenarios: int = 5000           # scenarios per pass; categories are balanced per pass
+    num_passes: int = 1                # how many times to sweep over the seed list
     n_robots: int = 1                  # task sequencing -> one drone
     n_tasks: int = None                  # None = random number of tasks per category (see scenario_gen.py)
     service_scale: float = 60.0        # [s] divides service time before it enters the network
 
     # ---- PPO -------------------------------------------------------------
-    epochs_per_scenario: int = 10       # PPO epochs on each scenario's rollout batch
+    epochs_per_scenario: int = 2       # PPO epochs on each scenario's rollout batch
     rollouts_per_scenario: int = 64    # parallel episodes per scenario (each gets its own lambda)
     minibatch_size: int = 128
-    lr: float = 2e-4
+    lr: float = 3e-4
     gamma: float = 1.0                 # discount (episodes are short -> 1.0)
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
@@ -92,7 +92,7 @@ class HP:
     check_energy: bool = True          # cross-check step-wise energy against tour_energy()
 
     # ---- mid-episode preference switching ------------------------------------
-    pref_switch_task_threshold: int = 10   # episode needs > this many tasks to be eligible
+    pref_switch_task_threshold: int = 6   # episode needs > this many tasks to be eligible
     pref_switch_max_injections: int = 2    # number of lambda flips per eligible episode (0 = off)
 
     # ---- network -----------------------------------------------------------
@@ -552,6 +552,16 @@ def injection_steps_for(n_tasks):
     return sorted(steps)
 
 
+def balanced_category_schedule(n_scenarios, seed):
+    """Return a shuffled schedule with category counts differing by at most one."""
+    if n_scenarios < 0:
+        raise ValueError("n_scenarios must be non-negative")
+    n_categories = len(CATEGORIES["payload_kg"])
+    schedule = np.arange(n_scenarios, dtype=int) % n_categories
+    np.random.default_rng(seed).shuffle(schedule)
+    return schedule.tolist()
+
+
 # ======================================================================
 # Training
 # ======================================================================
@@ -567,22 +577,34 @@ def train():
     optimizer = torch.optim.Adam(policy.parameters(), lr=hp.lr)
     start_iter = load_checkpoint(run_dir, policy, optimizer) if hp.resume else 0
 
-    seeds = [hp.start_seed + i for i in range(hp.num_scenarios)] * hp.num_passes
+    seeds = [hp.start_seed + i for _ in range(hp.num_passes)
+             for i in range(hp.num_scenarios)]
+    categories = [
+        category
+        for pass_idx in range(hp.num_passes)
+        for category in balanced_category_schedule(hp.num_scenarios, hp.start_seed + pass_idx)
+    ]
     log_path = os.path.join(run_dir, "train_log.csv")
     if not os.path.exists(log_path):
         with open(log_path, "w") as f:
             f.write("iter,seed,category,ret,E_wh,T_s,unserved,E_lamE_high,T_lamE_high,"
                     "E_lamT_high,T_lamT_high,pg_loss,v_loss,entropy,kl,energy_check_err\n")
 
+    category_counts = np.bincount(
+        balanced_category_schedule(hp.num_scenarios, hp.start_seed),
+        minlength=len(CATEGORIES["payload_kg"]))
     print(f"Run '{hp.run_id}' on {dev}: {len(seeds)} scenarios, start iteration {start_iter}")
+    print(f"Per-pass scenario counts by category: {category_counts.tolist()}")
 
     for it in range(start_iter, len(seeds)):
         seed = seeds[it]
+        category = categories[it]
         B = hp.rollouts_per_scenario
 
         # ---- 1. scenario (one robot, N tasks) ----------------------------------
         robots, task_pos, task_payload, task_service, _, err = generate_scenario(
-            hp.n_robots, hp.n_tasks, seed=seed, return_meta=True)
+            hp.n_robots, hp.n_tasks, seed=seed, return_meta=True,
+            robot_category=category)
         if err is not None:
             print(f"[it {it}] seed {seed}: scenario error ({err}) -> skipped")
             continue
