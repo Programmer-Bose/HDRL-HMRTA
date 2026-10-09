@@ -1,7 +1,7 @@
 {
   "run_id": "ts3-run_002",
   "save_root": "checkpoints",
-  "save_every": 1000,
+  "save_every": 100,
   "resume": true,
   "resume_path": "",
   "device": "cuda",

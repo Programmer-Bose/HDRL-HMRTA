@@ -55,9 +55,9 @@ from drone_energy import DroneEnergyModel, SPEED_LEVELS, RESERVE_SOC
 @dataclass
 class HP:
     # ---- run / checkpoints ---------------------------------------------
-    run_id: str = "ts3-run_002"            # checkpoints go to <save_root>/<run_id>/
+    run_id: str = "ts3-run_003"            # checkpoints go to <save_root>/<run_id>/
     save_root: str = "checkpoints"
-    save_every: int = 1000               # save a checkpoint every N iterations (scenarios)
+    save_every: int = 100               # save a checkpoint every N iterations (scenarios)
     resume: bool = True               # True -> continue this run_id from its latest checkpoint
     resume_path: str = ""              # optional explicit .pt file ("" = latest in the run folder)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,14 +65,14 @@ class HP:
 
     # ---- scenarios -------------------------------------------------------
     start_seed: int = 42               # scenarios use seeds start_seed ... start_seed + num_scenarios - 1
-    num_scenarios: int = 1500
-    num_passes: int = 1                # how many times to sweep over the seed list
+    num_scenarios: int = 200
+    num_passes: int = 3                # how many times to sweep over the seed list
     n_robots: int = 1                  # task sequencing -> one drone
     n_tasks: int = None                  # None = random number of tasks per category (see scenario_gen.py)
     service_scale: float = 60.0        # [s] divides service time before it enters the network
 
     # ---- PPO -------------------------------------------------------------
-    epochs_per_scenario: int = 5       # PPO epochs on each scenario's rollout batch
+    epochs_per_scenario: int = 10       # PPO epochs on each scenario's rollout batch
     rollouts_per_scenario: int = 64    # parallel episodes per scenario (each gets its own lambda)
     minibatch_size: int = 128
     lr: float = 2e-4
@@ -526,7 +526,7 @@ def load_checkpoint(run_dir, policy, optimizer):
         print("No checkpoint found -> starting from scratch.")
         return 0
 
-    ckpt = torch.load(path, map_location=hp.device)
+    ckpt = torch.load(path, map_location=hp.device, weights_only=True)
     policy.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     skip = {"resume", "resume_path", "device"}

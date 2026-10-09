@@ -31,19 +31,19 @@ from scenario_gen import generate_scenario
 # ======================================================================
 # TEST SETTINGS  (edit here only)
 # ======================================================================
-RUN_ID = "ts3-run_001"
+RUN_ID = "ts3-run_002"
 SAVE_ROOT = "checkpoints"
 CKPT_PATH = ""                    # "" = latest checkpoint of RUN_ID, or give a .pt path
-TEST_START_SEED = 141          # unseen seeds (training used 43 ... 142)
-NUM_TEST_SCENARIOS = 1
+TEST_START_SEED = 132          # unseen seeds (training used 43 ... 142)
+NUM_TEST_SCENARIOS = 10
 TEST_N_TASKS = None               # None = task count follows the robot category
 N_LAMBDAS = 11                    # lambda_E = 0, 0.1, ..., 1
 GREEDY = True                     # True = argmax actions, False = sample
 TEST_PREF_SWITCH_MAX_INJECTIONS = 2  # None = use checkpoint setting; set an int to override
 TEST_PREF_SWITCH_TASK_THRESHOLD = 10  # None = use checkpoint setting; set an int to override
 PLOT_LAMBDAS_E = [0.0, 0.2, 1.0]  # lambda_E values drawn in the 3D plots
-SAVE_FIGS = False
-SHOW_FIGS = True
+SAVE_FIGS = True
+SHOW_FIGS = False
 OUT_DIR = os.path.join("test_results", RUN_ID)
 PASS_THRESHOLD_PCT = 1.0          # energy-focused must save >= this % energy and lose >= this % time
 
@@ -60,7 +60,7 @@ def load_model():
         assert files, f"No checkpoint found in {os.path.join(SAVE_ROOT, RUN_ID)}"
         path = files[-1]
 
-    ckpt = torch.load(path, map_location=dev)
+    ckpt = torch.load(path, map_location=dev, weights_only=True)
     for k, v in ckpt["hparams"].items():              # use the network sizes etc. used in training
         if hasattr(tp.hp, k):
             setattr(tp.hp, k, v)
@@ -94,7 +94,7 @@ def rollout(policy, env, task_f, robot_f, lam):
         valid.append(env.active.clone())
         load_n = env.load / env.cap
         t_used_n = env.T_used / 3600.0
-        task, _, speed_frac, _, x_ret, _, _ = policy.act(
+        task, _, speed_frac, x_ret, _, _, _ = policy.act(
             task_f, robot_f, state, lam, ok, env.speed_feat, load_n, t_used_n,
             env.depot, deterministic=GREEDY)
         _, _, _, _, ret_frac_used = env.step(task, speed_frac, x_ret)
@@ -193,7 +193,7 @@ def plot_pareto(results):
     fig.colorbar(sc, ax=axes.ravel().tolist(), label="lambda_E  (red = energy, blue = time)")
     fig.suptitle("Energy vs makespan for lambda_E = 0 ... 1 (same scenario)")
     if SAVE_FIGS:
-        fig.savefig(os.path.join(OUT_DIR, "pareto.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(OUT_DIR, f"pareto_{r['seed']}_{RUN_ID}.png"), dpi=150, bbox_inches="tight")
 
 
 def draw_tour(ax, pos, depot, order, speed_fracs, ret_speed_frac, vmax, title,
@@ -255,7 +255,7 @@ def plot_tours(r, show_idx):
                       bbox_to_anchor=(0.5, -0.12), ncol=3, fontsize=8, title_fontsize=9)
     fig.suptitle(f"Visiting sequence (numbers) - seed {r['seed']}, category {r['cat']}")
     if SAVE_FIGS:
-        fig.savefig(os.path.join(OUT_DIR, f"tours_seed{r['seed']}.png"), dpi=150, bbox_inches="tight")
+        fig.savefig(os.path.join(OUT_DIR, f"tours_seed{r['seed']}_{RUN_ID}.png"), dpi=150, bbox_inches="tight")
 
 
 # ======================================================================
