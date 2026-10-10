@@ -3,6 +3,23 @@ train_assignment.py
 --------------------
 Top-layer (task ASSIGNMENT) training for heterogeneous multi-robot MRTA.
 
+OBJECTIVES (this version -- unrelated to the lower-layer sequencer's own
+energy/time objective):
+    f1  fleet launch cost      (minimize) -- sum of per-category launch cost
+                                 over LAUNCHED robots, normalized by the
+                                 total cost of the whole fleet pool.
+    f2  peak load ratio        (minimize) -- max over launched robots of
+                                 assigned payload / capacity.
+    f3  depot reserve readiness (maximize) -- min over depots of the
+                                 fraction of that depot's capacity left
+                                 UNlaunched; scalarized as f3' = 1 - f3
+                                 (minimized), since every term in the
+                                 reward is "lower is better".
+The frozen sequencer is used ONLY to check constraint 3 (battery
+feasibility of each robot's assigned task set), with a FIXED lambda =
+[0.5, 0.5] -- independent of w, so none of the top-layer preference leaks
+into the sequencer.
+
 One-shot assignment network:
     - A single transformer forward pass encodes all tasks and all robots of
       a scenario into embeddings, then a [N_tasks, N_robots+1] compatibility
@@ -18,19 +35,13 @@ Embedded lower layer (frozen):
     - For a given scenario + assignment, each robot's subset of assigned
       tasks is handed to the frozen single-drone PPO sequencer
       (FiLMPointerPolicy from train_ppo.py) which decides visiting order and
-      speeds. Its resulting energy/time is read off via SingleDroneEnv +
-      DroneEnergyModel. This makes the sequencer a pure black-box evaluator.
+      speeds, at a FIXED lambda = [0.5, 0.5]. The only thing read off is
+      whether every assigned task actually got served within the battery
+      budget -- the sequencer is a pure feasibility checker here, not an
+      objective source.
 
-Objectives (top layer), combined with a 3D preference vector
-w = [w_makespan, w_energy, w_variance] ~ Dirichlet, scalarised into one reward:
-    1. makespan        = max_i T_i                     (max completion time)
-    2. mean SOC-drop   = mean over robots assigned tasks of
-                         (E_i / usable_battery_i)
-    3. payload variance = variance over robots assigned tasks of
-                          (assigned_payload_i / payload_capacity_i)
-                         Idle robots do not affect either objective.
-w_makespan and w_energy are also translated into the sequencer's own local
-2D preference lambda = [lambda_E, lambda_T] per robot (see `w_to_lambda`).
+Preference vector w = [w1, w2, w3] ~ Dirichlet(alpha,alpha,alpha), scalarised
+linearly into one reward:  min  w1*f1n + w2*f2 + w3*(1 - f3).
 
 Files needed in the same folder: scenario_gen.py, drone_energy.py, train_ppo.py
 A trained lower-layer checkpoint is expected at hp.lower_checkpoint (placeholder
@@ -49,7 +60,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Dirichlet
 
-from scenario_gen import generate_scenario, DEPOTS, CATEGORIES
+from scenario_gen import generate_fleet_inventory, generate_fleet_tasks, DEPOTS, CATEGORIES
 from drone_energy import DroneEnergyModel, RESERVE_SOC, SPEED_LEVELS
 from train_ppo import FiLMPointerPolicy, hp as seq_hp
 
@@ -59,9 +70,9 @@ from train_ppo import FiLMPointerPolicy, hp as seq_hp
 # ======================================================================
 @dataclass
 class HP:
-    run_id: str = "assign-run_004"
+    run_id: str = "assign-run_001"
     save_root: str = "checkpoints_assign"
-    save_every: int = 20
+    save_every: int = 25
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     torch_seed: int = 1
 
@@ -69,24 +80,26 @@ class HP:
     lower_checkpoint: str = "ts3-run_004/ts3-run_004_it05000_ep10000.pt"   # <-- set this
 
     # ---- scenario sampling -----------------------------------------------
-    robot_counts: tuple = (10, 15, 20)
-    task_count_range: tuple = (30, 60)      # inclusive, sampled uniformly (covers 50..100)
+    # robots PER CATEGORY PER DEPOT (inclusive); total fleet size per scenario
+    # = len(DEPOTS) * n_categories * a value sampled from this range.
+    robots_per_cat_depot_range: tuple = (3, 5)
+    task_count_range: tuple = (30, 70)      # inclusive, sampled uniformly (covers 50..100)
     start_seed: int = 1
     num_iterations: int = 200
     scenarios_per_iter: int = 8             # batch of independent scenarios per PPO update
 
     # ---- PPO ---------------------------------------------------------------
-    epochs_per_iter: int = 2
-    lr: float = 3e-4
+    epochs_per_iter: int = 4
+    lr: float = 2e-4
     clip_eps: float = 0.2
     value_coef: float = 0.5
     entropy_coef: float = 0.01
     max_grad_norm: float = 0.5
 
     # ---- objective weights / normalisation -------------------------------
-    pref_alpha: float = 0.5          # Dirichlet(alpha,alpha,alpha) over [makespan, energy, variance]
-    unassigned_penalty: float = 2.0  # reward penalty per task left unassigned
-    makespan_norm_s: float = 3600.0  # rough normaliser so makespan is O(1) in the reward
+    pref_alpha: float = 0.5          # Dirichlet(alpha,alpha,alpha) over [w1=cost, w2=peak_load, w3=reserve]
+    unassigned_penalty: float = 2.0  # reward penalty per task the capacity mask couldn't place
+    battery_penalty: float = 2.0     # reward penalty per task assigned but not served within battery
     diversity_coef: float = 0.5
     # ---- network -----------------------------------------------------------
     d_model: int = 128
@@ -105,12 +118,16 @@ ROBOT_DIM = 8    # same as lower layer: 4 normalised specs + 4-way category one-
 # Scenario batch generation (variable robots AND tasks per scenario)
 # ======================================================================
 def sample_scenario(seed):
-    """One scenario with a random fleet size and random task count, mixed categories."""
-    rng = np.random.default_rng(seed)
-    n_robots = int(rng.choice(hp.robot_counts))
-    n_tasks = int(rng.integers(hp.task_count_range[0], hp.task_count_range[1] + 1))
-    robots, task_pos, task_payload, task_service, _, err = generate_scenario(
-        n_robots, n_tasks, seed=seed, return_meta=True)   # random mixed categories
+    """One scenario: a per-depot fleet POOL (generate_fleet_inventory) plus a
+    task set sized against that pool (generate_fleet_tasks). Independent seed
+    streams for the fleet, the task count, and the task set itself, so they
+    don't become correlated with each other."""
+    inv_seed, task_seed, n_seed = np.random.SeedSequence(seed).spawn(3)
+    robots = generate_fleet_inventory(seed=inv_seed, count_range=hp.robots_per_cat_depot_range)
+    n_tasks = int(np.random.default_rng(n_seed).integers(
+        hp.task_count_range[0], hp.task_count_range[1] + 1))
+    task_pos, task_payload, task_service, err = generate_fleet_tasks(
+        robots, n_tasks, seed=task_seed)
     return robots, task_pos, task_payload, task_service, err
 
 
@@ -145,8 +162,10 @@ class FiLM(nn.Module):
     def __init__(self, cond_dim, feat_dim):
         super().__init__()
         self.lin = nn.Linear(cond_dim, 2 * feat_dim)
-        nn.init.zeros_(self.lin.weight)
-        nn.init.zeros_(self.lin.bias)
+        # small random init instead of zero -> preference has a non-trivial effect
+        # from step 1, instead of needing gradient pressure to move off identity
+        nn.init.normal_(self.lin.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.lin.bias)      # keep beta at 0 start; gamma gets slight nonzero spread
 
     def forward(self, h, cond):
         gamma, beta = self.lin(cond).chunk(2, dim=-1)
@@ -163,9 +182,11 @@ class AssignmentPolicy(nn.Module):
                                             dropout=0.0, batch_first=True)
         self.task_encoder = nn.TransformerEncoder(layer, num_layers=hp.n_enc_layers)
         self.robot_mlp = nn.Sequential(nn.Linear(ROBOT_DIM, d), nn.ReLU(), nn.Linear(d, d))
-
         self.pref_mlp = nn.Sequential(nn.Linear(3, d), nn.ReLU(), nn.Linear(d, d))
-        # FiLM preference injection into BOTH task and robot embeddings
+        self.pref_bias_mlp = nn.Sequential(nn.Linear(2 * d, d), nn.ReLU(), nn.Linear(d, 1))
+        # learnable scale on the pairwise preference bias, init > 1 so it competes
+        # with (q·k)/sqrt(d) immediately instead of being drowned out
+        self.pref_gate = nn.Parameter(torch.tensor(3.0))
         self.film_task = FiLM(d, d)
         self.film_robot = FiLM(d, d)
         # extra scalar bias per (task,robot) pair from preference, added to logits directly
@@ -195,7 +216,13 @@ class AssignmentPolicy(nn.Module):
         q_exp = q[:, None, :].expand(N, M, -1)
         k_exp = k[None, :, :].expand(N, M, -1)
         pref_bias = self.pref_bias_mlp(torch.cat([q_exp, k_exp], dim=-1)).squeeze(-1)  # [N,M]
-        logits_robots = logits_robots + pref_bias
+        logits_robots = logits_robots + self.pref_gate * pref_bias
+
+        # --- debug: check if pref_bias is in a competitive range ---
+        # if torch.rand(1).item() < 0.02:   # print ~2% of calls to avoid flooding the console
+        #     print(f"   [debug] base_logits std={ (logits_robots - self.pref_gate*pref_bias).std().item():.4f} "
+        #           f"| pref_bias.abs().mean()={pref_bias.abs().mean().item():.4f} "
+        #           f"| gated_bias.abs().mean()={(self.pref_gate*pref_bias).abs().mean().item():.4f}")
 
         drop_col = self.unassigned_logit.expand(N, 1)
         logits = torch.cat([logits_robots, drop_col], dim=1)              # [N,M+1]
@@ -234,6 +261,11 @@ def decode_assignment(logits, task_payload, robot_capacity, deterministic=False,
         infeasible = remaining < task_payload[i]                              # [M] bool
         all_infeasible = infeasible.all()                                      # no robot can take it
 
+        # --- debug: how many robots are actually feasible for this task? ---
+        # if torch.rand(1).item() < 0.01:   # ~1% sample to avoid flooding
+        #     n_feasible = (~infeasible).sum().item()
+        #     print(f"   [debug] task {i}: n_feasible_robots={n_feasible} / {M}")
+            
         # mask: a robot slot is masked if it's infeasible.
         # the drop column (index M) is masked UNLESS all robots are infeasible.
         robot_mask = infeasible
@@ -263,19 +295,9 @@ def decode_assignment(logits, task_payload, robot_capacity, deterministic=False,
 # robots of the SAME scenario instead, each with its own heterogeneous
 # physics (via model.leg_cost's per-row `ids`) and its own task subset.
 # ======================================================================
-def w_to_lambda(w):
-    """Top-layer [w_makespan, w_energy, w_variance] -> sequencer's local [lam_E, lam_T].
-    Normalised over ALL three weights (not just w[0]+w[1]) so w=[0,0,1] gives a safe,
-    well-defined lam instead of a 1e-8 blowup."""
-    eps = 1e-6
-    wm, we, wv = w[0] + eps, w[1] + eps, w[2] + eps
-    s = wm + we + wv
-    # the variance weight doesn't map to the sequencer; redistribute it proportionally
-    # between E/T so lam stays meaningful even when wm=we=0
-    lam_T = ((wm + wv * 0.5) / s).item()
-    lam_E = ((we + wv * 0.5) / s).item()
-    total = lam_E + lam_T
-    return torch.tensor([lam_E / total, lam_T / total], dtype=torch.float32, device=hp.device)
+# fixed sequencer preference -- the sequencer is used ONLY as a battery-feasibility
+# checker for the current version, so its own E/T trade-off never sees w.
+SEQ_FIXED_LAM = [0.5, 0.5]
 
 
 class BatchedFleetEnv:
@@ -433,34 +455,66 @@ def batched_policy_act(seq_policy, task_f, robot_f, state, lam, ok, speed_feat,
     return task, speed_frac, x_ret
 
 
-def fleet_objectives(env):
-    """Return makespan, mean SOC drop, and load variance over assigned robots.
+def fleet_objectives(robots, assign, task_payload):
+    """f1n (launch cost), f2 (peak load ratio), f3 (depot reserve readiness),
+    all O(N + M) -- straight from the assignment, no sequencer rollout needed.
 
-    Robots with no assigned tasks are excluded from the energy average and
-    payload-load variance. The empty-fleet case returns zero for all metrics.
+    assign : numpy [N], robot index 0..M-1 the task went to, or M = unassigned.
+    Returns (f1n, f2, f3, launched) where `launched` is a bool [M] mask
+    (y_r), handed back so the caller doesn't need to recompute it.
     """
-    assigned_robots = env.valid.any(dim=1)
-    if not assigned_robots.any():
-        return 0.0, 0.0, 0.0
+    cap = robots["payload_kg"]
+    cost = robots["launch_cost"]
+    depot = robots["depot_id"]
+    M = len(cap)
 
-    load_frac = (env.pay * env.valid).sum(1) / env.cap.clamp(min=1e-6)
-    makespan = env.T_used[assigned_robots].max().item()
-    mean_soc_drop = (
-        env.E_used[assigned_robots] / env.usable[assigned_robots].clamp(min=1e-6)
-    ).mean().item()
-    payload_var = load_frac[assigned_robots].var(unbiased=False).item()
-    return makespan, mean_soc_drop, payload_var
+    launched = np.zeros(M, dtype=bool)
+    served = assign[assign < M]
+    if served.size:
+        launched[np.unique(served)] = True
+
+    cost_total = cost.sum()
+    f1n = float(cost[launched].sum() / cost_total) if cost_total > 0 else 0.0
+
+    L_r = np.zeros(M)
+    if served.size:
+        np.add.at(L_r, served, task_payload[assign < M])
+    load_ratio = np.zeros(M)
+    has_cap = cap > 0
+    load_ratio[has_cap] = L_r[has_cap] / cap[has_cap]
+    f2 = float(load_ratio[launched].max()) if launched.any() else 0.0
+
+    depots = np.unique(depot)
+    rho = np.ones(len(depots))
+    for i, d in enumerate(depots):
+        mask = depot == d
+        total_cap = cap[mask].sum()
+        if total_cap > 0:
+            rho[i] = cap[mask & ~launched].sum() / total_cap
+    f3 = float(rho.min()) if len(rho) else 1.0
+
+    return f1n, f2, f3, launched
 
 
 @torch.no_grad()
-def evaluate_assignment(seq_policy, robots, task_pos, task_payload, task_service, assign, w):
-    """Runs the frozen sequencer for every robot in the fleet AT ONCE (batched
-    over robots), instead of looping robot-by-robot. Returns the three raw
-    objective values plus the count of unassigned tasks."""
+def evaluate_assignment(seq_policy, robots, task_pos, task_payload, task_service, assign):
+    """f1n/f2/f3 come straight from the assignment (no sequencer needed).
+    The frozen sequencer runs ONCE, at the fixed lambda (SEQ_FIXED_LAM),
+    purely to check constraint 3: whether every launched robot can actually
+    serve its full assigned task set within its battery budget. Any assigned
+    task the sequencer leaves unvisited is a battery violation.
+    Returns (f1n, f2, f3, n_unassigned, n_battery_violations).
+    """
+    M = len(robots["category"])
+    f1n, f2, f3, launched = fleet_objectives(robots, assign, task_payload)
+    n_unassigned = int((assign == M).sum())
+
+    if not launched.any():
+        return f1n, f2, f3, n_unassigned, 0
+
     env = BatchedFleetEnv(robots, assign, task_pos, task_payload, task_service, hp.device)
     env.reset()
-    M = env.M
-    lam = w_to_lambda(w)[None, :].expand(M, 2)
+    lam = torch.as_tensor(SEQ_FIXED_LAM, dtype=torch.float32, device=hp.device)[None, :].expand(env.M, 2)
     task_f = fleet_task_features_batched(env.pos, env.pay, env.srv, env.cap)
     robot_f = all_robot_features(robots)
     pad_mask = ~env.valid                                     # padding only, constant across steps
@@ -474,18 +528,16 @@ def evaluate_assignment(seq_policy, robots, task_pos, task_payload, task_service
             env.load / env.cap, env.T_used / 3600.0, env.depot, pad_mask)
         env.step(task, speed_frac, x_ret)
 
-    load_frac = (env.pay * env.valid).sum(1) / env.cap.clamp(min=1e-6)
-    makespan, mean_soc_drop, payload_var = fleet_objectives(env)
-    n_unassigned = int((assign == M).sum())
-    return makespan, mean_soc_drop, payload_var, n_unassigned
+    unserved = (~env.visited) & env.valid                     # assigned but never actually served
+    n_battery_violations = int(unserved.sum().item())
+    return f1n, f2, f3, n_unassigned, n_battery_violations
 
 
-def scalarize(makespan, mean_soc_drop, payload_var, n_unassigned, w):
-    """Weighted-sum scalarisation (swap for Chebyshev later if desired)."""
-    r = -(w[0].item() * (makespan / hp.makespan_norm_s)
-          + w[1].item() * mean_soc_drop
-          + w[2].item() * payload_var)
+def scalarize(f1n, f2, f3, n_unassigned, n_battery_violations, w):
+    """R = -(w1*f1n + w2*f2 + w3*(1-f3)) - p_un*n_unassigned - p_bat*n_battery_violations."""
+    r = -(w[0].item() * f1n + w[1].item() * f2 + w[2].item() * (1.0 - f3))
     r -= hp.unassigned_penalty * n_unassigned
+    r -= hp.battery_penalty * n_battery_violations
     return r
 
 
@@ -525,16 +577,16 @@ def run_scenario(assign_policy, seq_policy, seed, n_pref=3):
     for w in ws:
         logits, value = assign_policy(task_f, robot_f, w)
         assign, logp, ent = decode_assignment(logits, payload_t, capacity)
-        makespan, mean_soc, pvar, n_un = evaluate_assignment(
-            seq_policy, robots, task_pos, task_payload, task_service, assign.cpu().numpy(), w)
-        reward = scalarize(makespan, mean_soc, pvar, n_un, w)
+        f1n, f2, f3, n_un, n_bat = evaluate_assignment(
+            seq_policy, robots, task_pos, task_payload, task_service, assign.cpu().numpy())
+        reward = scalarize(f1n, f2, f3, n_un, n_bat, w)
         results.append({
             "task_f": task_f, "robot_f": robot_f, "w": w, "capacity": capacity,
             "payload": payload_t, "assign": assign, "logp": logp.detach(),
             "value": value.detach(), "reward": torch.tensor(reward, device=hp.device),
             "entropy": ent.detach(),
             "log_row": [seed, len(robots["category"]), len(task_payload),
-                        makespan, mean_soc, pvar, n_un, reward],
+                        f1n, f2, f3, n_un, n_bat, reward],
         })
         assigns_for_diversity.append(assign)
 
@@ -623,14 +675,14 @@ def train():
     log_path = os.path.join(run_dir, "train_log.csv")
     if not os.path.exists(log_path):
         with open(log_path, "w") as f:
-            f.write("iter,seed,n_robots,n_tasks,makespan,mean_soc_drop,payload_var,"
-                    "n_unassigned,reward,pg_loss,v_loss,entropy\n")
+            f.write("iter,seed,n_robots,n_tasks,f1n_launch_cost,f2_peak_load,f3_reserve,"
+                    "n_unassigned,n_battery_violations,reward,pg_loss,v_loss,entropy\n")
 
     seed = hp.start_seed
     for it in range(hp.num_iterations):
         batch = []
         while len(batch) < hp.scenarios_per_iter:
-            res = run_scenario(assign_policy, seq_policy, seed, n_pref=3)
+            res = run_scenario(assign_policy, seq_policy, seed, n_pref=6)
             seed += 1
             if res is not None:
                 batch.extend(res)
@@ -642,10 +694,11 @@ def train():
                 row = [it] + b["log_row"] + [pg, vf, ent]
                 f.write(",".join(f"{x:.5g}" if isinstance(x, float) else str(x) for x in row) + "\n")
 
-        if (it + 1) % 10 == 0:
-            mean_r = np.mean([b["reward"].item() for b in batch])
-            print(f"[it {it + 1}/{hp.num_iterations}] mean reward {mean_r:.3f} | "
-                  f"pg {pg:.3f} vf {vf:.3f} ent {ent:.3f}")
+            if (it + 1) % 10 == 0:
+                mean_r = np.mean([b["reward"].item() for b in batch])
+                print(f"[it {it + 1}/{hp.num_iterations}] mean reward {mean_r:.3f} | "
+                    f"pg {pg:.3f} vf {vf:.3f} ent {ent:.3f}")
+                # print(f"   pref_gate = {assign_policy.pref_gate.item():.3f}")   # <-- add this line
 
         if (it + 1) % hp.save_every == 0 or it + 1 == hp.num_iterations:
             path = os.path.join(run_dir, f"{hp.run_id}_it{it + 1:05d}.pt")

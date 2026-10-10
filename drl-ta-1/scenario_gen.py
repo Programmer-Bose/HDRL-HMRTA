@@ -22,9 +22,22 @@ SERVICE_PER_KG_S = 3.0
 WORLD_SIZE_M = 1000.0
 
 DEPOTS = np.array(
-    [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
+    [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0.5, 0.5, 0]],
     dtype=float,
 )
+
+# ----------------------------------------------------------------------
+# Top-layer fleet inventory (per-depot pools, used by the new launch-cost /
+# peak-load / depot-reserve objectives). Each depot holds a random number
+# of robots per category, drawn from this (min, max inclusive) range. The
+# pool is kept larger than the expected number of launches so "reserve
+# readiness" is a meaningful objective (if every robot is always needed,
+# nothing is ever left in reserve).
+# ----------------------------------------------------------------------
+ROBOTS_PER_CATEGORY_PER_DEPOT = (3, 7)
+# Launch cost per category index 0..3 (low -> high). Strictly increasing,
+# matching the category ordering (bigger drones cost more to launch).
+LAUNCH_COST = [1.0, 2.0, 4.0, 8.0]
 
 
 def sample_task_points(rng, n_tasks, max_tries=100000, *, return_meta=False):
@@ -159,9 +172,17 @@ def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False,
 
     rng = np.random.default_rng(seed)
 
+    depot_id = np.arange(n_robots) % len(DEPOTS)
+
     if robot_category is None:
         probs = rng.dirichlet(np.ones(n_categories) * 5)
-        categories = rng.choice(n_categories, size=n_robots, p=probs)
+        base_size = int((depot_id == 0).sum())                 # robots in depot 0 (reference count)
+        template = rng.choice(n_categories, size=base_size, p=probs)   # same multiset for every depot
+        categories = np.empty(n_robots, dtype=int)
+        for d in range(len(DEPOTS)):
+            idx = np.where(depot_id == d)[0]
+            cats = np.resize(template, len(idx))               # trim/pad if a depot's size differs
+            categories[idx] = rng.permutation(cats)
     else:
         probs = np.eye(n_categories)[robot_category]
         categories = np.full(n_robots, robot_category, dtype=int)
@@ -172,7 +193,7 @@ def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False,
         "flight_min": np.array(CATEGORIES["flight_min"])[categories],
         "battery_wh": np.array(CATEGORIES["battery_wh"])[categories],
         "speed_ms": np.array(CATEGORIES["speed_ms"])[categories],
-        "depot_id": np.arange(n_robots) % 4,
+        "depot_id": depot_id,
     }
 
     if n_tasks is None:      # task count follows the robot category
@@ -199,6 +220,67 @@ def generate_scenario(n_robots, n_tasks=None, seed=None, *, return_meta=False,
     if return_meta:
         return robots, task_pos, task_payload, task_service, probs, None
     return robots, task_pos, task_payload, task_service, probs
+
+
+def generate_fleet_inventory(seed=None, n_depots=None,
+                              count_range=ROBOTS_PER_CATEGORY_PER_DEPOT):
+    """Build the top-layer robot POOL: every depot gets a random number of
+    robots of EVERY category (counts can differ across depots), independent
+    of any task scenario. This is the fleet the assignment policy chooses
+    from -- only some of these robots end up launched (y_r = 1).
+
+    Returns a `robots` dict with the same fields/shape convention as
+    `generate_scenario` (category, payload_kg, flight_min, battery_wh,
+    speed_ms, depot_id), plus `launch_cost` (per-robot, from LAUNCH_COST).
+    Robots are ordered depot-by-depot, category-by-category.
+    """
+    rng = np.random.default_rng(seed)
+    n_categories = len(CATEGORIES["payload_kg"])
+    if n_depots is None:
+        n_depots = len(DEPOTS)
+
+    category_list, depot_list = [], []
+    counts = rng.integers(count_range[0], count_range[1] + 1, size=n_categories)   # same for every depot
+    for d in range(n_depots):
+        for c, n in enumerate(counts):
+            category_list += [c] * int(n)
+            depot_list += [d] * int(n)
+
+    categories = np.array(category_list, dtype=int)
+    depot_id = np.array(depot_list, dtype=int)
+
+    robots = {
+        "category": categories,
+        "payload_kg": np.array(CATEGORIES["payload_kg"])[categories],
+        "flight_min": np.array(CATEGORIES["flight_min"])[categories],
+        "battery_wh": np.array(CATEGORIES["battery_wh"])[categories],
+        "speed_ms": np.array(CATEGORIES["speed_ms"])[categories],
+        "depot_id": depot_id,
+        "launch_cost": np.array(LAUNCH_COST)[categories],
+    }
+    return robots
+
+
+def generate_fleet_tasks(robots, n_tasks, seed=None, payload_usage_range=(0.50, 0.70)):
+    """Task set sized against the WHOLE fleet pool's capacity (not just the
+    robots that end up launched -- we don't know that yet). Lower
+    payload_usage than `generate_scenario` by default, since the pool is
+    deliberately oversized versus `generate_scenario`'s single-fleet case.
+
+    Returns (task_pos, task_payload, task_service, error_message).
+    """
+    rng = np.random.default_rng(seed)
+    task_pos, task_error = sample_task_points(rng, n_tasks, return_meta=True)
+    if task_error is not None:
+        warnings.warn(task_error, RuntimeWarning)
+        return task_pos, np.zeros(0, dtype=float), np.zeros(0, dtype=float), task_error
+
+    payload_usage = rng.uniform(*payload_usage_range)
+    total_payload = payload_usage * robots["payload_kg"].sum()
+    shares = rng.dirichlet(np.ones(n_tasks) * 5)
+    task_payload = total_payload * shares
+    task_service = SERVICE_BASE_S + SERVICE_PER_KG_S * task_payload
+    return task_pos, task_payload, task_service, None
 
 
 def travel_time_s(robots, robot_id, p_from, p_to):
@@ -268,13 +350,13 @@ def plot_scenario(robots, task_pos, task_payload, task_service):
 
 
 def main():
-    n_robots = 50
+    n_robots = 25
     n_tasks = 100
 
     robots, task_pos, task_payload, task_service, probs, error = generate_scenario(
         n_robots,
         n_tasks,
-        seed=43,
+        seed=42,
         return_meta=True,
     )
 

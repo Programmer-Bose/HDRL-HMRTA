@@ -3,12 +3,14 @@ ta_infer_and_plot.py
 --------------------
 End-to-end TEST / INFERENCE script for the top-layer policy in ta_train.py.
 
-Set N_ROBOTS and N_TASKS below, then run this file. It generates one scenario,
-uses the trained assignment policy with its payload-capacity mask, runs the
-frozen sequencer for each robot, and plots the fleet routes.
+Set SEED and PREFERENCES below, then run this file. It generates an inventory
+and task set with ta_train.sample_scenario, evaluates the same scenario for each
+preference vector, and plots each assignment with the training sequencer's fixed
+battery-feasibility preference.
 
-Tasks that cannot fit within any remaining robot capacity are left unassigned,
-matching ta_train.decode_assignment. Missing checkpoints fall back to random
+The reported objectives and reward match ta_train. Tasks that cannot fit within
+any remaining robot capacity are left unassigned, matching
+ta_train.decode_assignment. Missing checkpoints fall back to random
 initialisation for pipeline sanity checks only.
 """
 
@@ -18,10 +20,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from scenario_gen import CATEGORIES, DEPOTS, generate_scenario
+from scenario_gen import (
+    CATEGORIES,
+    DEPOTS,
+    generate_fleet_inventory,
+    generate_fleet_tasks,
+)
 from ta_train import (
     AssignmentPolicy,
     BatchedFleetEnv,
+    SEQ_FIXED_LAM,
     all_robot_features,
     batched_policy_act,
     decode_assignment,
@@ -30,20 +38,24 @@ from ta_train import (
     fleet_objectives,
     hp as assign_hp,
     load_frozen_sequencer,
-    w_to_lambda,
+    scalarize,
 )
 
 
 # ---- Set these for a test run ------------------------------------------
-N_ROBOTS = 10
+N_ROBOTS = 15
 N_TASKS = 30
 SEED = 42
-PREFERENCE = (0.8, 0.2, 0.1)  # [w_makespan, w_energy, w_variance]
+PREFERENCES = [
+    (0.8, 0.1, 0.1),
+    (0.1, 0.8, 0.1),
+    (0.1, 0.1, 0.8),
+]  # each: [w_launch_cost, w_peak_load, w_depot_reserve]
 
 ASSIGN_CHECKPOINT = os.path.join(
     assign_hp.save_root,
     assign_hp.run_id,
-    "assign-run_004_it00140.pt",
+    "assign-run_001_it00025.pt",
 )
 # ------------------------------------------------------------------------
 
@@ -66,17 +78,16 @@ def load_assignment_policy():
     return policy
 
 
-def run_once(n_robots, n_tasks, seed, w_tuple):
-    robots, task_pos, task_payload, task_service, _, err = generate_scenario(
-        n_robots, n_tasks, seed=seed, return_meta=True
-    )
-    if err is not None:
-        raise RuntimeError(f"scenario generation failed: {err}")
-
-    assign_policy = load_assignment_policy()
-    seq_policy = load_frozen_sequencer()
-    w = torch.tensor(w_tuple, dtype=torch.float32, device=DEVICE)
-
+def run_preference(
+    robots,
+    task_pos,
+    task_payload,
+    task_service,
+    seed,
+    w_tuple,
+    assign_policy,
+    seq_policy,
+):
     fleet_cap_ref = max(CATEGORIES["payload_kg"])
     task_f = fleet_task_features(task_pos, task_payload, task_service, fleet_cap_ref)
     robot_f = all_robot_features(robots)
@@ -84,6 +95,7 @@ def run_once(n_robots, n_tasks, seed, w_tuple):
         robots["payload_kg"], dtype=torch.float32, device=DEVICE
     )
     payload = torch.as_tensor(task_payload, dtype=torch.float32, device=DEVICE)
+    w = torch.tensor(w_tuple, dtype=torch.float32, device=DEVICE)
     with torch.no_grad():
         logits, _ = assign_policy(task_f, robot_f, w)
         # ta_train's decoder masks each robot once its payload capacity is used;
@@ -93,12 +105,16 @@ def run_once(n_robots, n_tasks, seed, w_tuple):
         )
     assign_np = assign.cpu().numpy()
 
+    f1n, f2, f3, launched = fleet_objectives(robots, assign_np, task_payload)
+    n_unassigned = int((assign_np == len(robots["category"])).sum())
     env = BatchedFleetEnv(
         robots, assign_np, task_pos, task_payload, task_service, DEVICE
     )
     env.reset()
     n_fleet_robots = env.M
-    lam = w_to_lambda(w)[None, :].expand(n_fleet_robots, 2)
+    lam = torch.as_tensor(SEQ_FIXED_LAM, dtype=torch.float32, device=DEVICE)[
+        None, :
+    ].expand(n_fleet_robots, 2)
     seq_task_f = fleet_task_features_batched(env.pos, env.pay, env.srv, env.cap)
     pad_mask = ~env.valid
 
@@ -135,9 +151,9 @@ def run_once(n_robots, n_tasks, seed, w_tuple):
                 if newly_finished[r]:
                     paths[r].append(env.depot[r].cpu().numpy())
 
-    load_frac = (env.pay * env.valid).sum(1) / env.cap.clamp(min=1e-6)
-    makespan, mean_soc_drop, payload_var = fleet_objectives(env)
-    n_unassigned = int((assign == n_fleet_robots).sum().item())
+    unserved = (~env.visited) & env.valid
+    n_battery_violations = int(unserved.sum().item())
+    reward = scalarize(f1n, f2, f3, n_unassigned, n_battery_violations, w)
     return {
         "robots": robots,
         "task_pos": task_pos,
@@ -150,44 +166,133 @@ def run_once(n_robots, n_tasks, seed, w_tuple):
         "total_task_capacity": float(np.sum(task_payload)),
         "assign": assign_np,
         "n_unassigned": n_unassigned,
+        "n_battery_violations": n_battery_violations,
+        "launched": launched,
         "paths": paths,
-        "E_used": env.E_used.cpu().numpy(),
-        "T_used": env.T_used.cpu().numpy(),
-        "soc_drop": (
-            env.E_used / env.usable.clamp(min=1e-6)
-        ).cpu().numpy() * 100.0,
-        "load_frac": load_frac.cpu().numpy(),
-        "makespan": makespan,
-        "mean_soc_drop": mean_soc_drop,
-        "payload_var": payload_var,
+        "f1n_launch_cost": f1n,
+        "f2_peak_load": f2,
+        "f3_reserve": f3,
+        "reward": reward,
     }
 
 
-def print_summary(res):
-    robots = res["robots"]
+def run_preferences(n_robots, n_tasks, seed, preferences):
+    if n_robots <= 0:
+        raise ValueError("n_robots must be greater than zero.")
+    if n_tasks <= 0:
+        raise ValueError("n_tasks must be greater than zero.")
+
+    inventory_seed, selection_seed, task_seed = np.random.SeedSequence(seed).spawn(3)
+    robots = generate_fleet_inventory(
+        seed=inventory_seed,
+        count_range=assign_hp.robots_per_cat_depot_range,
+    )
+    if len(robots["category"]) < n_robots:
+        n_depots = len(DEPOTS)
+        n_categories = len(CATEGORIES["payload_kg"])
+        robots_per_category = max(
+            assign_hp.robots_per_cat_depot_range[0],
+            int(np.ceil(n_robots / (n_depots * n_categories))),
+        )
+        robots = generate_fleet_inventory(
+            seed=inventory_seed,
+            count_range=(robots_per_category, robots_per_category),
+        )
+
+    if n_robots < len(robots["category"]):
+        rng = np.random.default_rng(selection_seed)
+        selected = np.sort(
+            rng.choice(len(robots["category"]), size=n_robots, replace=False)
+        )
+        robots = {key: values[selected] for key, values in robots.items()}
+
+    task_pos, task_payload, task_service, err = generate_fleet_tasks(
+        robots, n_tasks, seed=task_seed
+    )
+    if err is not None:
+        raise RuntimeError(f"scenario generation failed: {err}")
+
+    assign_policy = load_assignment_policy()
+    seq_policy = load_frozen_sequencer()
+    results = [
+        run_preference(
+            robots,
+            task_pos,
+            task_payload,
+            task_service,
+            seed,
+            preference,
+            assign_policy,
+            seq_policy,
+        )
+        for preference in preferences
+    ]
+    if not results:
+        return results
+
+    for result in results:
+        result["n_robots"] = n_robots
+        result["n_tasks"] = n_tasks
+
+    diversity_bonus = 0.0
+    for i, left in enumerate(results):
+        for right in results[i + 1:]:
+            preference_distance = sum(
+                abs(a - b)
+                for a, b in zip(left["preference"], right["preference"])
+            )
+            same_assignment_fraction = float(
+                np.mean(left["assign"] == right["assign"])
+            )
+            diversity_bonus -= (
+                assign_hp.diversity_coef
+                * preference_distance
+                * same_assignment_fraction
+            )
+
+    if results:
+        for result in results:
+            result["diversity_bonus"] = diversity_bonus / len(results)
+            result["reward"] += result["diversity_bonus"]
+    return results
+
+
+def print_scenario(res):
     print("=== Input scenario ===")
+    print(f"Seed: {res['seed']}")
     print(f"Robots: {res['n_robots']}")
     print(f"Tasks: {res['n_tasks']}")
     print(f"Total robot payload capacity: {res['total_robot_capacity']:.2f} kg")
     print(f"Total task payload: {res['total_task_capacity']:.2f} kg")
-
-    print("\n=== Per-robot summary ===")
-    print(f"{'R':>3} {'cat':>3} {'#tasks':>7} {'load%':>7} {'SOC drop%':>10} {'T (s)':>8}")
-    for r in range(len(robots["category"])):
-        n_tasks_r = int((res["assign"] == r).sum())
-        print(
-            f"{r:>3} {robots['category'][r]:>3} {n_tasks_r:>7} "
-            f"{res['load_frac'][r] * 100:>6.1f}% "
-            f"{res['soc_drop'][r]:>9.1f}% {res['T_used'][r]:>8.0f}"
-        )
-    print(f"\nUnassigned tasks: {res['n_unassigned']}")
-    print("\n=== Objective values (ta_train) ===")
-    print(f"Makespan: {res['makespan']:.2f} s ({res['makespan'] / 60:.2f} min)")
     print(
-        f"Mean SOC drop: {res['mean_soc_drop']:.6f} "
-        f"({res['mean_soc_drop'] * 100:.2f}%)"
+        "Task payload / fleet capacity: "
+        f"{res['total_task_capacity'] / res['total_robot_capacity']:.1%}"
     )
-    print(f"Payload utilization variance: {res['payload_var']:.6f}")
+
+
+def print_summary(res):
+    print(f"\n=== Preference: {res['preference']} ===")
+    assignment_vector = [
+        int(robot) if int(robot) < res["n_robots"] else None
+        for robot in res["assign"]
+    ]
+    print(f"Assignment vector (task index -> robot index): {assignment_vector}")
+    print("(None indicates an unassigned task.)")
+    print(f"Unassigned task count: {res['n_unassigned']}")
+    print(f"Battery-feasibility violations: {res['n_battery_violations']}")
+    print("Objective values (matching ta_train):")
+    print(f"  f1 normalized launch cost: {res['f1n_launch_cost']:.6f} (minimize)")
+    print(
+        f"  f2 peak launched-robot load ratio: "
+        f"{res['f2_peak_load']:.6f} (minimize)"
+    )
+    print(
+        f"  f3 minimum depot reserve readiness: "
+        f"{res['f3_reserve']:.6f} (maximize)"
+    )
+    print(f"Training-style reward: {res['reward']:.6f}")
+    if res.get("diversity_bonus", 0.0):
+        print(f"  (includes diversity bonus {res['diversity_bonus']:.6f})")
 
 
 def plot_result(res, out_path=None):
@@ -236,9 +341,10 @@ def plot_result(res, out_path=None):
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     ax.set_title(
-        f"ta_train assignment + routes ({n_fleet_robots} robots, "
+        f"ta_train assignment + battery check ({n_fleet_robots} robots, "
         f"{len(task_pos)} tasks)\n"
-        f"unassigned={res['n_unassigned']}, makespan={res['makespan']:.0f}s"
+        f"launch cost={res['f1n_launch_cost']:.3f}, "
+        f"peak load={res['f2_peak_load']:.3f}, reserve={res['f3_reserve']:.3f}"
     )
     ax.legend(loc="upper left", fontsize=7, ncol=2)
     plt.tight_layout()
@@ -251,6 +357,9 @@ def plot_result(res, out_path=None):
 
 
 if __name__ == "__main__":
-    result = run_once(N_ROBOTS, N_TASKS, SEED, PREFERENCE)
-    print_summary(result)
-    plot_result(result)
+    results = run_preferences(N_ROBOTS, N_TASKS, SEED, PREFERENCES)
+    if results:
+        print_scenario(results[0])
+    for result in results:
+        print_summary(result)
+        plot_result(result)
