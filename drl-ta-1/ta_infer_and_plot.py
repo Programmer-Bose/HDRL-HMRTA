@@ -27,6 +27,7 @@ from ta_train import (
     decode_assignment,
     fleet_task_features,
     fleet_task_features_batched,
+    fleet_objectives,
     hp as assign_hp,
     load_frozen_sequencer,
     w_to_lambda,
@@ -37,12 +38,12 @@ from ta_train import (
 N_ROBOTS = 10
 N_TASKS = 30
 SEED = 42
-PREFERENCE = (0.8, 0.1, 0.1)  # [w_makespan, w_energy, w_variance]
+PREFERENCE = (0.8, 0.2, 0.1)  # [w_makespan, w_energy, w_variance]
 
 ASSIGN_CHECKPOINT = os.path.join(
     assign_hp.save_root,
     assign_hp.run_id,
-    f"{assign_hp.run_id}_it{assign_hp.num_iterations:05d}.pt",
+    "assign-run_004_it00140.pt",
 )
 # ------------------------------------------------------------------------
 
@@ -135,10 +136,7 @@ def run_once(n_robots, n_tasks, seed, w_tuple):
                     paths[r].append(env.depot[r].cpu().numpy())
 
     load_frac = (env.pay * env.valid).sum(1) / env.cap.clamp(min=1e-6)
-    mean_soc_drop = (
-        env.E_used / env.usable.clamp(min=1e-6)
-    ).mean().item()
-    payload_var = load_frac.var(unbiased=False).item()
+    makespan, mean_soc_drop, payload_var = fleet_objectives(env)
     n_unassigned = int((assign == n_fleet_robots).sum().item())
     return {
         "robots": robots,
@@ -159,7 +157,7 @@ def run_once(n_robots, n_tasks, seed, w_tuple):
             env.E_used / env.usable.clamp(min=1e-6)
         ).cpu().numpy() * 100.0,
         "load_frac": load_frac.cpu().numpy(),
-        "makespan": env.T_used.max().item(),
+        "makespan": makespan,
         "mean_soc_drop": mean_soc_drop,
         "payload_var": payload_var,
     }
