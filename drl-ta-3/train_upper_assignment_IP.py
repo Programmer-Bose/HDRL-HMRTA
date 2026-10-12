@@ -60,13 +60,13 @@ from train_ppo import FiLMPointerPolicy, HP as LowerHP, task_features as lower_t
 # ======================================================================
 @dataclass
 class UpperHP:
-    run_id: str = "upper-assign-run_003-FTIP"
-    save_root: str = "drive/MyDrive/HDRL-MRTA/drl-ta-3/checkpoints"
-    save_every: int = 100
+    run_id: str = "upper-assign-run_004-FTIP"
+    save_root: str = "checkpoints"
+    save_every: int = 25
     resume: bool = False
     resume_path: str = ""
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_seed: int = 7
+    torch_seed: int = 6
 
     # ---- frozen lower-layer sequencer ----
     lower_run_dir: str = "ts3-run_004"   # where train_ppo.py saved its checkpoints
@@ -78,7 +78,7 @@ class UpperHP:
 
     # ---- scenarios (multi-robot now) ----
     start_seed: int = 1
-    num_scenarios: int = 100
+    num_scenarios: int = 200
     num_passes: int = 2
     n_robots_range: tuple = (3, 8)        # randint per scenario
     n_tasks: int = None                   # None = category-driven, as in scenario_gen
@@ -515,7 +515,7 @@ def train():
     sequencer = FrozenSequencer(hp.lower_run_dir, hp.lower_ckpt_path, dev)
 
     policy = AssignmentPolicy().to(dev)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=hp.lr)
+    optimizer = torch.optim.AdamW(policy.parameters(), lr=hp.lr)
     start_iter = load_checkpoint(run_dir, policy, optimizer) if hp.resume else 0
 
     rng = np.random.default_rng(hp.start_seed)

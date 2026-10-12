@@ -41,7 +41,7 @@ from train_upper_assignment import (
 class TestHP:
     n_robots: int = 5
     n_tasks: int = None                    # None = category-driven random count
-    seed: int = 71
+    seed: int = 55
 
     # Any number of (w_makespan, w_minSoC, w_payloadVar) vectors; each is auto-normalised.
     upper_lambda_set: List[Tuple[float, float, float]] = field(default_factory=lambda: [

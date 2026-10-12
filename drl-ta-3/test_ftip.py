@@ -43,20 +43,20 @@ from train_upper_assignment_IP import (
 # ======================================================================
 @dataclass
 class TestHP:
-    n_robots: int = 5
-    seed: int = 71                      # n_tasks is NOT set here -- it comes from the
+    n_robots: int = 10
+    seed: int = 25                      # n_tasks is NOT set here -- it comes from the
                                           # scenario generator automatically, given the seed
 
     # Any number of (w_makespan, w_minSoC, w_payloadVar) vectors; each is auto-normalised.
     upper_lambda_set: List[Tuple[float, float, float]] = field(default_factory=lambda: [
         (1.0, 0.0, 0.0),     # makespan-only
         (0.0, 1.0, 0.0),     # min-SoC-only
-        (0.0, 0.0, 1.0),     # payload-balance-only
-        # (0.5, 0.3, 0.2),
-        # (0.34, 0.33, 0.33),  # near-balanced
+        # (0.0, 0.0, 1.0),     # payload-balance-only
+        (0.6, 0.3, 0.1),
+        (0.34, 0.33, 0.33),  # near-balanced
     ])
 
-    upper_ckpt: str = r"checkpoints\upper-assign-run_002\upper-assign-run_002_it02000.pt"
+    upper_ckpt: str = r"checkpoints\upper-assign-run_004-FTIP\upper-assign-run_004-FTIP_it00400.pt"
     lower_run_dir: str = hp.lower_run_dir
     lower_ckpt_path: str = hp.lower_ckpt_path   # "" = latest checkpoint in lower_run_dir
 

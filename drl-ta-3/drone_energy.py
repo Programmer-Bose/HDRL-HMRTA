@@ -88,7 +88,15 @@ class DroneEnergyModel:
         p_hover = self.hover_power(ids, load)
         t_fly = dist / v
 
-        e_travel = (p_hover + self.k_drag[ids] * v ** 3) * t_fly / 3600.0
+        # Fixed per-leg "airborne" baseline, charged at the robot's RATED speed so it no
+        # longer blows up as v -> 0 (removes the 1/v hover term that caused the U-shape).
+        # Only the drag term below still depends on chosen speed -- and it's purely
+        # increasing in v, so faster always costs more, slower always costs less.
+        t_fly_ref = dist / self.speed[ids]
+        e_hover_travel = p_hover * t_fly_ref / 3600.0
+        e_drag = self.k_drag[ids] * v ** 2 * dist / 3600.0     # = k_drag*v^3 * (dist/v) simplified
+
+        e_travel = e_hover_travel + e_drag
         e_climb = mass * G * climb / (MOTOR_EFF * 3600.0)
         e_service = p_hover * service_s / 3600.0
 
